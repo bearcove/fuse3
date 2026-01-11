@@ -185,8 +185,18 @@ version = "2.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a347d3b94606a7b3d588fe1ff7f41996bbb3690ade4e79935b26565af10e03f"
 dependencies = [
+ "bincode_derive-next",
  "serde",
  "unty-next",
+]
+
+[[package]]
+name = "bincode_derive-next"
+version = "2.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "197e777c78cc9fbe8396cf82e18f84bb6026b8ec534ebb3097f4d98894e8b540"
+dependencies = [
+ "virtue-next",
 ]
 
 [[package]]
@@ -336,7 +346,6 @@ dependencies = [
  "futures-util",
  "libc",
  "nix",
- "serde",
  "slab",
  "tokio",
  "tracing",
@@ -865,6 +874,12 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
+
+[[package]]
+name = "virtue-next"
+version = "0.0.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4daab4b8a8c3c1408ea5e60a5d380790ff15d0cfe0333c14ce98210c1339fd8"
 
 [[package]]
 name = "wasi"

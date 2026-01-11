@@ -28,7 +28,7 @@ use async_global_executor::{self as task, Task as JoinHandle};
     feature = "unprivileged"
 ))]
 use async_process::Command;
-use bincode_next::serde::{decode_from_slice, encode_into_std_write, encode_to_vec};
+use bincode_next::{decode_from_slice, encode_into_std_write, encode_to_vec};
 use bytes::Bytes;
 use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures_util::future::{Either, FutureExt};

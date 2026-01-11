@@ -3,7 +3,7 @@
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;
 
-use bincode_next::serde::encode_into_std_write;
+use bincode_next::encode_into_std_write;
 use bytes::{Buf, Bytes};
 use futures_channel::mpsc::UnboundedSender;
 use futures_util::future::Either;
