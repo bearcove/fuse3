@@ -1,6 +1,5 @@
 use std::mem;
 
-use bincode::{DefaultOptions, Options};
 use nix::sys::stat::mode_t;
 
 use crate::FileType;
@@ -57,9 +56,6 @@ pub const fn get_padding_size(dir_entry_size: usize) -> usize {
     entry_size - dir_entry_size
 }
 
-pub fn get_bincode_config() -> impl Options {
-    DefaultOptions::new()
-        .with_little_endian()
-        .allow_trailing_bytes()
-        .with_fixint_encoding()
+pub fn get_bincode_config() -> impl bincode_next::config::Config {
+    bincode_next::config::legacy()
 }

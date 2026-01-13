@@ -48,6 +48,7 @@ minver_task:
   freebsd_instance:
     image: freebsd-14-3-release-amd64-ufs
   setup_script:
+    - pkg install -y ca_root_nss
     - fetch https://sh.rustup.rs -o rustup.sh
     - sh rustup.sh -y --default-toolchain nightly --profile=minimal
     - . $HOME/.cargo/env
