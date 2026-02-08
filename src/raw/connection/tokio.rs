@@ -563,12 +563,38 @@ impl NonBlockFuseConnection {
     ) -> CompleteIoResult<(Vec<u8>, T), usize> {
         let _guard = self.read.lock().await;
 
+        // Tokio uses edge-triggered epoll (EPOLLET). With edge-triggered
+        // notifications, we only get woken when the fd transitions from
+        // not-ready to ready. If multiple FUSE requests arrive before we
+        // read, we get ONE edge notification. Reading a single request
+        // consumes the edge, and subsequent requests sit unread because
+        // no new edge fires — the fd was never "not ready" in between.
+        //
+        // Fix: always try a non-blocking read FIRST, before waiting for
+        // an epoll edge. This drains any data left over from a previous
+        // edge, ensuring we never miss pending requests.
         loop {
+            match uio::readv(
+                self.fd.get_ref(),
+                &mut [
+                    IoSliceMut::new(&mut header_buf),
+                    IoSliceMut::new(&mut data_buf),
+                ],
+            ) {
+                Ok(n) => return ((header_buf, data_buf), Ok(n)),
+                Err(nix::errno::Errno::EAGAIN) => {
+                    // Nothing pending — fall through to wait for next edge
+                }
+                Err(e) => return ((header_buf, data_buf), Err(io::Error::from(e))),
+            }
+
+            // Wait for the fd to become readable (epoll edge notification)
             let mut read_guard = match self.fd.ready(Interest::READABLE | Interest::ERROR).await {
                 Err(err) => return ((header_buf, data_buf), Err(err)),
                 Ok(read_guard) => read_guard,
             };
 
+            // Try via the guard so tokio can clear readiness on EAGAIN
             if let Ok(result) = read_guard.try_io(|fd| {
                 uio::readv(
                     fd,
@@ -580,9 +606,8 @@ impl NonBlockFuseConnection {
                 .map_err(io::Error::from)
             }) {
                 return ((header_buf, data_buf), result);
-            } else {
-                continue;
             }
+            // Spurious wakeup — loop back to direct read attempt
         }
     }
 
