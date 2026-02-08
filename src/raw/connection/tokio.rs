@@ -3,6 +3,7 @@ use std::env;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::fs::File;
 use std::fs::OpenOptions;
+use std::future::Future;
 use std::io;
 #[cfg(any(
     all(target_os = "linux", feature = "unprivileged"),
@@ -13,7 +14,7 @@ use std::io::ErrorKind;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::io::Write;
 use std::io::{IoSlice, IoSliceMut};
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 #[cfg(any(
     all(target_os = "linux", feature = "unprivileged"),
     target_os = "freebsd",
@@ -31,7 +32,9 @@ use std::os::unix::io::RawFd;
 #[cfg(target_os = "macos")]
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::pin::pin;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 #[cfg(any(
     all(target_os = "linux", feature = "unprivileged"),
     target_os = "macos"
@@ -61,11 +64,6 @@ use nix::{
     target_os = "macos",
 ))]
 use tokio::io::unix::AsyncFd;
-#[cfg(any(
-    all(target_os = "linux", feature = "unprivileged"),
-    target_os = "freebsd",
-))]
-use tokio::io::Interest;
 #[cfg(any(
     all(target_os = "linux", feature = "unprivileged"),
     target_os = "macos"
@@ -150,11 +148,11 @@ impl FuseConnection {
         })
     }
 
-    pub async fn read_vectored<T: DerefMut<Target = [u8]> + Send + 'static>(
+    pub async fn read_vectored(
         &self,
         header_buf: Vec<u8>,
-        data_buf: T,
-    ) -> Option<CompleteIoResult<(Vec<u8>, T), usize>> {
+        data_buf: Vec<u8>,
+    ) -> Option<CompleteIoResult<(Vec<u8>, Vec<u8>), usize>> {
         let mut unmount_fut = pin!(self.unmount_notify.notified().fuse());
         let mut read_fut = pin!(self.inner_read_vectored(header_buf, data_buf).fuse());
 
@@ -164,11 +162,11 @@ impl FuseConnection {
         }
     }
 
-    async fn inner_read_vectored<T: DerefMut<Target = [u8]> + Send + 'static>(
+    async fn inner_read_vectored(
         &self,
         header_buf: Vec<u8>,
-        data_buf: T,
-    ) -> CompleteIoResult<(Vec<u8>, T), usize> {
+        data_buf: Vec<u8>,
+    ) -> CompleteIoResult<(Vec<u8>, Vec<u8>), usize> {
         match &self.mode {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             ConnectionMode::Block(connection) => {
@@ -351,11 +349,11 @@ impl BlockFuseConnection {
         })
     }
 
-    async fn read_vectored<T: DerefMut<Target = [u8]> + Send + 'static>(
+    async fn read_vectored(
         &self,
         mut header_buf: Vec<u8>,
-        mut data_buf: T,
-    ) -> CompleteIoResult<(Vec<u8>, T), usize> {
+        mut data_buf: Vec<u8>,
+    ) -> CompleteIoResult<(Vec<u8>, Vec<u8>), usize> {
         use std::io::Read;
         use std::mem::ManuallyDrop;
         use std::os::fd::{AsRawFd, FromRawFd};
@@ -415,7 +413,6 @@ impl BlockFuseConnection {
 #[derive(Debug)]
 struct NonBlockFuseConnection {
     fd: AsyncFd<OwnedFd>,
-    read: Mutex<()>,
     write: Mutex<()>,
 }
 
@@ -533,7 +530,6 @@ impl NonBlockFuseConnection {
 
         Ok(Self {
             fd: AsyncFd::new(fd)?,
-            read: Mutex::new(()),
             write: Mutex::new(()),
         })
     }
@@ -556,58 +552,15 @@ impl NonBlockFuseConnection {
         Ok(())
     }
 
-    async fn read_vectored<T: DerefMut<Target = [u8]> + Send>(
+    fn read_vectored(
         &self,
-        mut header_buf: Vec<u8>,
-        mut data_buf: T,
-    ) -> CompleteIoResult<(Vec<u8>, T), usize> {
-        let _guard = self.read.lock().await;
-
-        // Tokio uses edge-triggered epoll (EPOLLET). With edge-triggered
-        // notifications, we only get woken when the fd transitions from
-        // not-ready to ready. If multiple FUSE requests arrive before we
-        // read, we get ONE edge notification. Reading a single request
-        // consumes the edge, and subsequent requests sit unread because
-        // no new edge fires — the fd was never "not ready" in between.
-        //
-        // Fix: always try a non-blocking read FIRST, before waiting for
-        // an epoll edge. This drains any data left over from a previous
-        // edge, ensuring we never miss pending requests.
-        loop {
-            match uio::readv(
-                self.fd.get_ref(),
-                &mut [
-                    IoSliceMut::new(&mut header_buf),
-                    IoSliceMut::new(&mut data_buf),
-                ],
-            ) {
-                Ok(n) => return ((header_buf, data_buf), Ok(n)),
-                Err(nix::errno::Errno::EAGAIN) => {
-                    // Nothing pending — fall through to wait for next edge
-                }
-                Err(e) => return ((header_buf, data_buf), Err(io::Error::from(e))),
-            }
-
-            // Wait for the fd to become readable (epoll edge notification)
-            let mut read_guard = match self.fd.ready(Interest::READABLE | Interest::ERROR).await {
-                Err(err) => return ((header_buf, data_buf), Err(err)),
-                Ok(read_guard) => read_guard,
-            };
-
-            // Try via the guard so tokio can clear readiness on EAGAIN
-            if let Ok(result) = read_guard.try_io(|fd| {
-                uio::readv(
-                    fd,
-                    &mut [
-                        IoSliceMut::new(&mut header_buf),
-                        IoSliceMut::new(&mut data_buf),
-                    ],
-                )
-                .map_err(io::Error::from)
-            }) {
-                return ((header_buf, data_buf), result);
-            }
-            // Spurious wakeup — loop back to direct read attempt
+        header_buf: Vec<u8>,
+        data_buf: Vec<u8>,
+    ) -> ReadVectoredFut<'_> {
+        ReadVectoredFut {
+            conn: self,
+            header_buf: Some(header_buf),
+            data_buf: Some(data_buf),
         }
     }
 
@@ -634,6 +587,77 @@ impl NonBlockFuseConnection {
         match res {
             Err(err) => ((data, body_extend_data), Err(err.into())),
             Ok(n) => ((data, body_extend_data), Ok(n)),
+        }
+    }
+}
+
+/// Future returned by [`NonBlockFuseConnection::read_vectored`].
+///
+/// Uses `poll_read_ready` + `try_io` so that all reads go through tokio's
+/// readiness tracking. After a successful read, self-wakes to drain any
+/// remaining data before yielding — this is critical for edge-triggered
+/// epoll where a single edge may cover multiple pending FUSE requests.
+#[cfg(any(
+    all(target_os = "linux", feature = "unprivileged"),
+    target_os = "freebsd",
+))]
+struct ReadVectoredFut<'a> {
+    conn: &'a NonBlockFuseConnection,
+    header_buf: Option<Vec<u8>>,
+    data_buf: Option<Vec<u8>>,
+}
+
+#[cfg(any(
+    all(target_os = "linux", feature = "unprivileged"),
+    target_os = "freebsd",
+))]
+impl Future for ReadVectoredFut<'_> {
+    type Output = CompleteIoResult<(Vec<u8>, Vec<u8>), usize>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+
+        let header_buf = this.header_buf.as_mut().expect("polled after completion");
+        let data_buf = this.data_buf.as_mut().expect("polled after completion");
+
+        // poll_read_ready returns Poll::Pending if the fd is not known-ready,
+        // registering us for the next edge notification.
+        let mut guard = match this.conn.fd.poll_read_ready(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(err)) => {
+                let header_buf = this.header_buf.take().unwrap();
+                let data_buf = this.data_buf.take().unwrap();
+                return Poll::Ready(((header_buf, data_buf), Err(err)));
+            }
+            Poll::Ready(Ok(guard)) => guard,
+        };
+
+        match guard.try_io(|fd| {
+            uio::readv(
+                fd,
+                &mut [
+                    IoSliceMut::new(header_buf),
+                    IoSliceMut::new(data_buf),
+                ],
+            )
+            .map_err(io::Error::from)
+        }) {
+            Ok(result) => {
+                // After reading one request, there may be more pending
+                // from the same edge. Wake ourselves so the task stays
+                // runnable — the next read_vectored call will poll
+                // immediately rather than risk missing data if readiness
+                // gets cleared between calls.
+                cx.waker().wake_by_ref();
+                let header_buf = this.header_buf.take().unwrap();
+                let data_buf = this.data_buf.take().unwrap();
+                Poll::Ready(((header_buf, data_buf), result))
+            }
+            Err(_would_block) => {
+                // EAGAIN — fd is truly empty. try_io already cleared readiness,
+                // so the next poll_read_ready will wait for a fresh edge.
+                Poll::Pending
+            }
         }
     }
 }
