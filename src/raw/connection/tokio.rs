@@ -182,7 +182,7 @@ impl FuseConnection {
         }
     }
 
-    pub async fn write_vectored<T: Deref<Target = [u8]> + Send, U: Deref<Target = [u8]> + Send>(
+    pub async fn write_vectored<T: Deref<Target = [u8]> + Unpin + Send, U: Deref<Target = [u8]> + Unpin + Send>(
         &self,
         data: T,
         body_extend_data: Option<U>,
@@ -413,7 +413,6 @@ impl BlockFuseConnection {
 #[derive(Debug)]
 struct NonBlockFuseConnection {
     fd: AsyncFd<OwnedFd>,
-    write: Mutex<()>,
 }
 
 #[cfg(any(
@@ -530,7 +529,6 @@ impl NonBlockFuseConnection {
 
         Ok(Self {
             fd: AsyncFd::new(fd)?,
-            write: Mutex::new(()),
         })
     }
 
@@ -564,29 +562,15 @@ impl NonBlockFuseConnection {
         }
     }
 
-    async fn write_vectored<T: Deref<Target = [u8]> + Send, U: Deref<Target = [u8]> + Send>(
+    fn write_vectored<T: Deref<Target = [u8]> + Unpin + Send, U: Deref<Target = [u8]> + Unpin + Send>(
         &self,
         data: T,
         body_extend_data: Option<U>,
-    ) -> CompleteIoResult<(T, Option<U>), usize> {
-        let _guard = self.write.lock().await;
-
-        let res = {
-            let body_extend_data = body_extend_data.as_deref();
-
-            match body_extend_data {
-                None => uio::writev(&self.fd, &[IoSlice::new(data.deref())]),
-
-                Some(body_extend_data) => uio::writev(
-                    &self.fd,
-                    &[IoSlice::new(data.deref()), IoSlice::new(body_extend_data)],
-                ),
-            }
-        };
-
-        match res {
-            Err(err) => ((data, body_extend_data), Err(err.into())),
-            Ok(n) => ((data, body_extend_data), Ok(n)),
+    ) -> WriteVectoredFut<'_, T, U> {
+        WriteVectoredFut {
+            conn: self,
+            data: Some(data),
+            body_extend_data: Some(body_extend_data),
         }
     }
 }
@@ -658,6 +642,71 @@ impl Future for ReadVectoredFut<'_> {
                 // so the next poll_read_ready will wait for a fresh edge.
                 Poll::Pending
             }
+        }
+    }
+}
+
+/// Future returned by [`NonBlockFuseConnection::write_vectored`].
+///
+/// Same approach as [`ReadVectoredFut`]: uses `poll_write_ready` + `try_io`
+/// so writes go through tokio's readiness tracking, with self-wake after
+/// success to handle edge-triggered epoll correctly.
+#[cfg(any(
+    all(target_os = "linux", feature = "unprivileged"),
+    target_os = "freebsd",
+))]
+struct WriteVectoredFut<'a, T, U> {
+    conn: &'a NonBlockFuseConnection,
+    data: Option<T>,
+    body_extend_data: Option<Option<U>>,
+}
+
+#[cfg(any(
+    all(target_os = "linux", feature = "unprivileged"),
+    target_os = "freebsd",
+))]
+impl<T: Deref<Target = [u8]> + Unpin + Send, U: Deref<Target = [u8]> + Unpin + Send> Future
+    for WriteVectoredFut<'_, T, U>
+{
+    type Output = CompleteIoResult<(T, Option<U>), usize>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+
+        let data = this.data.as_ref().expect("polled after completion");
+        let body_extend_data = this
+            .body_extend_data
+            .as_ref()
+            .expect("polled after completion");
+
+        let mut guard = match this.conn.fd.poll_write_ready(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(err)) => {
+                let data = this.data.take().unwrap();
+                let body_extend_data = this.body_extend_data.take().unwrap();
+                return Poll::Ready(((data, body_extend_data), Err(err)));
+            }
+            Poll::Ready(Ok(guard)) => guard,
+        };
+
+        match guard.try_io(|fd| {
+            let body_extend_data = body_extend_data.as_deref();
+            match body_extend_data {
+                None => uio::writev(fd, &[IoSlice::new(data.deref())]),
+                Some(body_extend_data) => uio::writev(
+                    fd,
+                    &[IoSlice::new(data.deref()), IoSlice::new(body_extend_data)],
+                ),
+            }
+            .map_err(io::Error::from)
+        }) {
+            Ok(result) => {
+                cx.waker().wake_by_ref();
+                let data = this.data.take().unwrap();
+                let body_extend_data = this.body_extend_data.take().unwrap();
+                Poll::Ready(((data, body_extend_data), result))
+            }
+            Err(_would_block) => Poll::Pending,
         }
     }
 }
